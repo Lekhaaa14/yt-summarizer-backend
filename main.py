@@ -1,7 +1,9 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai
-import os, re, json, subprocess, glob
+import os, re, json
+import yt_dlp
+import requests
 
 app = FastAPI()
 
@@ -22,28 +24,33 @@ def extract_video_id(url: str):
     match = re.search(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})", url)
     return match.group(1) if match else None
 
-# ✅ NEW: Get transcript using yt-dlp
+# ✅ FINAL: Get transcript using yt-dlp Python API
 def get_transcript(video_url):
     try:
-        command = [
-            "yt-dlp",
-            "--write-auto-subs",
-            "--skip-download",
-            "--sub-lang", "en",
-            "--sub-format", "json3",
-            "-o", "subtitles",
-            video_url
-        ]
+        ydl_opts = {
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": ["en"],
+            "skip_download": True,
+            "quiet": True,
+        }
 
-        subprocess.run(command, check=True)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
 
-        files = glob.glob("subtitles*.json3")
+        subtitles = info.get("automatic_captions") or info.get("subtitles")
 
-        if not files:
-            raise Exception("No subtitles found")
+        if not subtitles:
+            raise Exception("No subtitles available")
 
-        with open(files[0], "r", encoding="utf-8") as f:
-            data = json.load(f)
+        en_subs = subtitles.get("en")
+        if not en_subs:
+            raise Exception("English subtitles not available")
+
+        sub_url = en_subs[0]["url"]
+
+        res = requests.get(sub_url)
+        data = res.json()
 
         transcript = []
         for event in data.get("events", []):
@@ -64,7 +71,7 @@ def get_transcript(video_url):
 def root():
     return {"status": "YouTube Summarizer API is running"}
 
-# ✅ Summarize
+# ✅ Summarize API
 @app.post("/api/summarize")
 async def summarize(body: dict):
     url = body.get("url", "")
@@ -73,19 +80,19 @@ async def summarize(body: dict):
     if not video_id:
         raise HTTPException(status_code=400, detail="Invalid YouTube URL")
 
-    # ✅ Use yt-dlp instead of blocked API
+    # ✅ Fetch transcript
     try:
         transcript_data = get_transcript(url)
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    # Format transcript
+    # ✅ Format transcript
     full_text = "\n".join([
         f"[{int(t['start'])}s] {t['text']}"
         for t in transcript_data
     ])
 
-    # Gemini prompt
+    # ✅ Gemini prompt
     prompt = f"""
 You are a YouTube video summarizer. Analyze this transcript and respond ONLY with valid JSON.
 
