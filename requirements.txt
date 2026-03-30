@@ -2,3 +2,4 @@ fastapi
 uvicorn
 youtube-transcript-api
 google-generativeai
+yt-dlp
