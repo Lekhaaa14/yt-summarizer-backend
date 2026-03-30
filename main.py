@@ -6,6 +6,7 @@ import os, re, json
 
 app = FastAPI()
 
+# ✅ CORS (important for frontend)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -13,56 +14,68 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Reads GEMINI_API_KEY from environment variable
+# ✅ Gemini API setup
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-model = genai.GenerativeModel("gemini-1.5-flash")  # free and fast
+model = genai.GenerativeModel("gemini-1.5-flash")
 
+# ✅ Extract YouTube video ID
 def extract_video_id(url: str):
     match = re.search(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})", url)
     return match.group(1) if match else None
 
+# ✅ Root check
 @app.get("/")
 def root():
     return {"status": "YouTube Summarizer API is running"}
 
+# ✅ Summarize endpoint
 @app.post("/api/summarize")
 async def summarize(body: dict):
     url = body.get("url", "")
 
-    # Extract video ID
+    # Validate URL
     video_id = extract_video_id(url)
     if not video_id:
         raise HTTPException(status_code=400, detail="Invalid YouTube URL")
 
-    # Fetch transcript
+    # ✅ FIXED: Fetch transcript (NEW API)
     try:
-        transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Transcript not available: {str(e)}")
+        transcript_list = YouTubeTranscriptApi().fetch(video_id)
 
-    # Format transcript with timestamps
+        transcript_data = [
+            {"text": t.text, "start": t.start}
+            for t in transcript_list
+        ]
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Transcript not available: {str(e)}"
+        )
+
+    # Format transcript
     full_text = "\n".join([
         f"[{int(t['start'])}s] {t['text']}"
         for t in transcript_data
     ])
 
-    # Send to Gemini
+    # Gemini prompt
     prompt = f"""
-You are a YouTube video summarizer. Analyze this transcript and respond ONLY with valid JSON, no extra text.
+You are a YouTube video summarizer. Analyze this transcript and respond ONLY with valid JSON.
 
 {{
-  "summary": "3-5 sentence summary of the entire video",
+  "summary": "3-5 sentence summary",
   "keyPoints": [
-    "key point 1",
-    "key point 2",
-    "key point 3",
-    "key point 4",
-    "key point 5"
+    "point 1",
+    "point 2",
+    "point 3",
+    "point 4",
+    "point 5"
   ],
   "timestamps": [
-    {{"time": "0:32", "seconds": 32, "label": "Brief topic label"}},
-    {{"time": "1:45", "seconds": 105, "label": "Brief topic label"}},
-    {{"time": "3:20", "seconds": 200, "label": "Brief topic label"}}
+    "0:32 - Topic",
+    "1:45 - Topic",
+    "3:20 - Topic"
   ]
 }}
 
@@ -70,18 +83,19 @@ Transcript:
 {full_text[:12000]}
 """
 
+    # Generate summary
     try:
         response = model.generate_content(prompt)
         raw = response.text.strip()
 
-        # Clean up markdown code fences if Gemini adds them
+        # Remove markdown formatting if present
         raw = re.sub(r"```json|```", "", raw).strip()
 
-        # Validate it's proper JSON
         parsed = json.loads(raw)
         return parsed
 
     except json.JSONDecodeError:
         raise HTTPException(status_code=500, detail="AI returned invalid JSON")
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI error: {str(e)}")
