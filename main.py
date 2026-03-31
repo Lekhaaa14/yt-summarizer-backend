@@ -4,6 +4,7 @@ from pydantic import BaseModel
 import google.generativeai as genai
 import os
 import re
+import json
 
 app = FastAPI(title="YouTube Summarizer API")
 
@@ -23,6 +24,8 @@ class SummarizeResponse(BaseModel):
     title: str
     video_id: str
     summary: str
+    keyPoints: list[str]
+    timestamps: list[str]
     transcript_length: int
 
 def get_gemini_model():
@@ -37,12 +40,6 @@ def extract_video_id(url: str) -> str:
     if match:
         return match.group(1)
     raise ValueError("Could not extract video ID from URL")
-
-STYLE_PROMPTS = {
-    "brief": "in 3-4 sentences, be concise",
-    "detailed": "in detail — cover the main topic, key points, and conclusions in 2-3 paragraphs",
-    "bullet": "as a bullet point list of all key ideas and takeaways",
-}
 
 @app.get("/")
 def root():
@@ -63,35 +60,45 @@ def summarize(req: SummarizeRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
     youtube_url = f"https://www.youtube.com/watch?v={video_id}"
-    style = STYLE_PROMPTS.get(req.style, STYLE_PROMPTS["detailed"])
 
-    prompt = f"""Please watch this YouTube video and summarize it {style}.
+    prompt = f"""Watch this YouTube video and respond ONLY with a valid JSON object — no markdown, no backticks, no extra text.
 
 Video URL: {youtube_url}
 
-At the very start of your response, write the video title on its own line in this format:
-TITLE: <title here>
-
-Then write the summary on the next line."""
+Return exactly this JSON structure:
+{{
+  "title": "the video title",
+  "summary": "2-3 paragraph summary of the video",
+  "keyPoints": ["key point 1", "key point 2", "key point 3", "key point 4", "key point 5"],
+  "timestamps": ["00:00 - Introduction", "01:30 - Topic 1", "05:00 - Topic 2"]
+}}"""
 
     try:
         response = model.generate_content(prompt)
-        full_text = response.text.strip()
+        raw = response.text.strip()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gemini API error: {str(e)}")
 
-    # Parse title out of response
-    title = f"Video {video_id}"
-    summary_text = full_text
-    for line in full_text.splitlines():
-        if line.strip().upper().startswith("TITLE:"):
-            title = line.split(":", 1)[1].strip()
-            summary_text = full_text.replace(line, "").strip()
-            break
+    # Strip markdown code fences if present
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+
+    try:
+        data = json.loads(raw)
+    except Exception:
+        # If JSON parse fails, return the raw text as summary
+        data = {
+            "title": f"Video {video_id}",
+            "summary": raw,
+            "keyPoints": [],
+            "timestamps": []
+        }
 
     return SummarizeResponse(
-        title=title,
+        title=data.get("title", f"Video {video_id}"),
         video_id=video_id,
-        summary=summary_text,
-        transcript_length=len(full_text),
+        summary=data.get("summary", ""),
+        keyPoints=data.get("keyPoints", []),
+        timestamps=data.get("timestamps", []),
+        transcript_length=len(raw),
     )
