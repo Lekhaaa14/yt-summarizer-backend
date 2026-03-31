@@ -6,6 +6,7 @@ import google.generativeai as genai
 import os
 import re
 
+# --- App setup ---
 app = FastAPI(title="YouTube Summarizer API")
 
 app.add_middleware(
@@ -16,10 +17,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- Gemini setup ---
 genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 model = genai.GenerativeModel("gemini-1.5-flash")
 
 
+# --- Schemas ---
 class SummarizeRequest(BaseModel):
     url: str
     style: str = "detailed"  # "brief", "detailed", "bullet"
@@ -32,14 +35,11 @@ class SummarizeResponse(BaseModel):
     transcript_length: int
 
 
+# --- Helpers ---
 def extract_video_id(url: str) -> str:
-    patterns = [
-        r"(?:v=|youtu\.be/|embed/|shorts/)([a-zA-Z0-9_-]{11})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
+    match = re.search(r"(?:v=|youtu\.be/|embed/|shorts/)([a-zA-Z0-9_-]{11})", url)
+    if match:
+        return match.group(1)
     raise ValueError("Could not extract video ID from URL")
 
 
@@ -62,11 +62,19 @@ STYLE_PROMPTS = {
 }
 
 
+# --- Routes ---
 @app.get("/")
 def root():
     return {"status": "ok", "message": "YouTube Summarizer API is running"}
 
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+# Both /api/summarize (v0 frontend default) and /summarize (legacy)
+@app.post("/api/summarize", response_model=SummarizeResponse)
 @app.post("/summarize", response_model=SummarizeResponse)
 def summarize(req: SummarizeRequest):
     try:
@@ -76,19 +84,13 @@ def summarize(req: SummarizeRequest):
 
     transcript = get_transcript(video_id)
 
-    # Gemini 1.5 Flash supports up to 1M tokens, but let's keep it reasonable
     max_chars = 100000
     trimmed = transcript[:max_chars]
     if len(transcript) > max_chars:
         trimmed += "\n\n[Transcript trimmed due to length]"
 
     style_prompt = STYLE_PROMPTS.get(req.style, STYLE_PROMPTS["detailed"])
-
-    prompt = f"""{style_prompt}
-
-Here is the transcript:
-
-{trimmed}"""
+    prompt = f"{style_prompt}\n\nHere is the transcript:\n\n{trimmed}"
 
     try:
         response = model.generate_content(prompt)
