@@ -1,6 +1,5 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import google.generativeai as genai
 import os
@@ -34,7 +33,14 @@ def get_gemini_model():
     if not api_key:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY not configured.")
     genai.configure(api_key=api_key)
-    return genai.GenerativeModel("gemini-2.5-flash")
+    return genai.GenerativeModel(
+        "gemini-2.5-flash",
+        generation_config=genai.GenerationConfig(
+            temperature=0.2,
+            max_output_tokens=3000,
+            response_mime_type="application/json",  # force JSON output
+        )
+    )
 
 def extract_video_id(url: str) -> str:
     match = re.search(r"(?:v=|youtu\.be/|embed/|shorts/)([a-zA-Z0-9_-]{11})", url)
@@ -62,65 +68,62 @@ def summarize(req: SummarizeRequest):
 
     youtube_url = f"https://www.youtube.com/watch?v={video_id}"
 
-    prompt = f"""You are an expert video analyst. Analyze this YouTube video thoroughly and respond ONLY with a valid JSON object — no markdown, no backticks, no explanation outside the JSON.
+    prompt = f"""Analyze this YouTube video completely and return a JSON object.
 
 Video URL: {youtube_url}
 
-IMPORTANT INSTRUCTIONS:
-- Watch/analyze the FULL video content
-- If the video is not in English, still summarize everything in English
-- The summary must be detailed, insightful, and capture the essence of the video
-- keyPoints must be the most important takeaways a viewer would want to know
-- timestamps should reflect the actual structure of the video (use real time markers if possible)
-- Be specific — avoid vague statements like "the video discusses X", instead say what was actually said about X
+Rules:
+- Watch the FULL video before summarizing
+- If the video language is not English, translate and summarize in English
+- The summary must be COMPLETE — do not cut off mid-sentence. Cover the entire video from start to finish.
+- Be specific and informative — mention actual concepts, tools, techniques, or arguments from the video
+- keyPoints must be standalone insights a viewer would find valuable even without watching
+- Timestamps must reflect the actual video structure with accurate time markers
 
-Return exactly this JSON structure:
+Return this exact JSON schema:
 {{
-  "title": "the actual video title",
-  "summary": "A thorough 3-4 paragraph summary covering the main topic, key arguments, examples used, and conclusions drawn. Be specific and informative.",
+  "title": "exact video title",
+  "summary": "Write 4-5 full paragraphs covering: (1) what the video is about and its goal, (2) the main content and techniques covered in the first half, (3) the main content covered in the second half, (4) specific examples, demos, or case studies shown, (5) final conclusions and recommendations from the creator. Every sentence must be complete. Do not truncate.",
   "keyPoints": [
-    "Specific key point 1",
-    "Specific key point 2", 
-    "Specific key point 3",
-    "Specific key point 4",
-    "Specific key point 5",
-    "Specific key point 6"
+    "Complete, specific key point 1",
+    "Complete, specific key point 2",
+    "Complete, specific key point 3",
+    "Complete, specific key point 4",
+    "Complete, specific key point 5",
+    "Complete, specific key point 6"
   ],
   "timestamps": [
-    "00:00 - Introduction / overview of what the video covers",
-    "MM:SS - Section title",
-    "MM:SS - Section title",
-    "MM:SS - Section title",
+    "00:00 - Introduction",
+    "MM:SS - Topic name",
+    "MM:SS - Topic name",
+    "MM:SS - Topic name",
     "MM:SS - Conclusion"
   ]
 }}"""
 
     try:
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.GenerationConfig(
-                temperature=0.3,  # lower = more focused, faster
-                max_output_tokens=2048,
-            )
-        )
+        response = model.generate_content(prompt)
         raw = response.text.strip()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gemini API error: {str(e)}")
 
-    # Strip markdown fences if present
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
+    # Clean up any markdown fences just in case
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+    raw = re.sub(r"\s*```\s*$", "", raw, flags=re.MULTILINE)
+    raw = raw.strip()
 
     try:
         data = json.loads(raw)
-    except Exception:
-        # Fallback: return raw as summary if JSON parse fails
-        data = {
-            "title": f"Video {video_id}",
-            "summary": raw,
-            "keyPoints": [],
-            "timestamps": []
-        }
+    except json.JSONDecodeError:
+        # Try to extract JSON object from the response if there's extra text
+        json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if json_match:
+            try:
+                data = json.loads(json_match.group())
+            except Exception:
+                data = {"title": f"Video {video_id}", "summary": raw, "keyPoints": [], "timestamps": []}
+        else:
+            data = {"title": f"Video {video_id}", "summary": raw, "keyPoints": [], "timestamps": []}
 
     return SummarizeResponse(
         title=data.get("title", f"Video {video_id}"),
