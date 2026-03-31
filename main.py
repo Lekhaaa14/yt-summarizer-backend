@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import google.generativeai as genai
 import os
@@ -61,32 +62,59 @@ def summarize(req: SummarizeRequest):
 
     youtube_url = f"https://www.youtube.com/watch?v={video_id}"
 
-    prompt = f"""Watch this YouTube video and respond ONLY with a valid JSON object — no markdown, no backticks, no extra text.
+    prompt = f"""You are an expert video analyst. Analyze this YouTube video thoroughly and respond ONLY with a valid JSON object — no markdown, no backticks, no explanation outside the JSON.
 
 Video URL: {youtube_url}
 
+IMPORTANT INSTRUCTIONS:
+- Watch/analyze the FULL video content
+- If the video is not in English, still summarize everything in English
+- The summary must be detailed, insightful, and capture the essence of the video
+- keyPoints must be the most important takeaways a viewer would want to know
+- timestamps should reflect the actual structure of the video (use real time markers if possible)
+- Be specific — avoid vague statements like "the video discusses X", instead say what was actually said about X
+
 Return exactly this JSON structure:
 {{
-  "title": "the video title",
-  "summary": "2-3 paragraph summary of the video",
-  "keyPoints": ["key point 1", "key point 2", "key point 3", "key point 4", "key point 5"],
-  "timestamps": ["00:00 - Introduction", "01:30 - Topic 1", "05:00 - Topic 2"]
+  "title": "the actual video title",
+  "summary": "A thorough 3-4 paragraph summary covering the main topic, key arguments, examples used, and conclusions drawn. Be specific and informative.",
+  "keyPoints": [
+    "Specific key point 1",
+    "Specific key point 2", 
+    "Specific key point 3",
+    "Specific key point 4",
+    "Specific key point 5",
+    "Specific key point 6"
+  ],
+  "timestamps": [
+    "00:00 - Introduction / overview of what the video covers",
+    "MM:SS - Section title",
+    "MM:SS - Section title",
+    "MM:SS - Section title",
+    "MM:SS - Conclusion"
+  ]
 }}"""
 
     try:
-        response = model.generate_content(prompt)
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.GenerationConfig(
+                temperature=0.3,  # lower = more focused, faster
+                max_output_tokens=2048,
+            )
+        )
         raw = response.text.strip()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gemini API error: {str(e)}")
 
-    # Strip markdown code fences if present
+    # Strip markdown fences if present
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
 
     try:
         data = json.loads(raw)
     except Exception:
-        # If JSON parse fails, return the raw text as summary
+        # Fallback: return raw as summary if JSON parse fails
         data = {
             "title": f"Video {video_id}",
             "summary": raw,
