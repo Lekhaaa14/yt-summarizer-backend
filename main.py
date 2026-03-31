@@ -1,31 +1,11 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import google.generativeai as genai
-import os, json, re
+from youtube_transcript_api import YouTubeTranscriptApi
 
-app = FastAPI()
+def extract_video_id(url):
+    import re
+    match = re.search(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]+)", url)
+    return match.group(1) if match else None
 
-# ✅ CORS FIX (IMPORTANT)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://yt-summarizer-frontend-qvcytp7kc-lekhaaa14s-projects.vercel.app"
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-# ✅ Gemini API setup
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-model = genai.GenerativeModel("gemini-1.5-flash")
-
-# ✅ Root route
-@app.get("/")
-def root():
-    return {"status": "YouTube Summarizer API is running"}
-
-# ✅ Summarize API
 @app.post("/api/summarize")
 async def summarize(body: dict):
     url = body.get("url", "")
@@ -33,43 +13,38 @@ async def summarize(body: dict):
     if not url:
         raise HTTPException(status_code=400, detail="No URL provided")
 
-    prompt = f"""
-You are a YouTube video summarizer.
+    try:
+        # ✅ Extract video ID
+        video_id = extract_video_id(url)
 
-Summarize the content of this YouTube video:
-{url}
+        if not video_id:
+            raise HTTPException(status_code=400, detail="Invalid YouTube URL")
 
-Return ONLY valid JSON in this format:
+        # ✅ Get transcript (SERVER SIDE → no CORS)
+        transcript = YouTubeTranscriptApi.get_transcript(video_id)
+        full_text = " ".join([t["text"] for t in transcript])
+
+        prompt = f"""
+Summarize this YouTube transcript.
+
+Return ONLY JSON:
 
 {{
   "summary": "3-5 sentence summary",
-  "keyPoints": [
-    "point 1",
-    "point 2",
-    "point 3",
-    "point 4",
-    "point 5"
-  ],
-  "timestamps": [
-    "0:32 - Topic",
-    "1:45 - Topic",
-    "3:20 - Topic"
-  ]
+  "keyPoints": ["point 1", "point 2", "point 3", "point 4", "point 5"],
+  "timestamps": ["0:32 - Topic", "1:45 - Topic", "3:20 - Topic"]
 }}
+
+Transcript:
+{full_text[:12000]}
 """
 
-    try:
         response = model.generate_content(prompt)
         raw = response.text.strip()
-
-        # ✅ Clean response
         raw = re.sub(r"```json|```", "", raw).strip()
 
         parsed = json.loads(raw)
         return parsed
 
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="AI returned invalid JSON")
-
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
