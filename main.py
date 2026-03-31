@@ -1,50 +1,104 @@
-from youtube_transcript_api import YouTubeTranscriptApi
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+import google.generativeai as genai
+import os
+import re
 
-def extract_video_id(url):
-    import re
-    match = re.search(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]+)", url)
-    return match.group(1) if match else None
+app = FastAPI(title="YouTube Summarizer API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Replace with your frontend URL in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+model = genai.GenerativeModel("gemini-1.5-flash")
 
 
-@app.post("/api/summarize")
-async def summarize(body: dict):
-    url = body.get("url", "")
+class SummarizeRequest(BaseModel):
+    url: str
+    style: str = "detailed"  # "brief", "detailed", "bullet"
 
-    if not url:
-        raise HTTPException(status_code=400, detail="No URL provided")
+
+class SummarizeResponse(BaseModel):
+    title: str
+    video_id: str
+    summary: str
+    transcript_length: int
+
+
+def extract_video_id(url: str) -> str:
+    patterns = [
+        r"(?:v=|youtu\.be/|embed/|shorts/)([a-zA-Z0-9_-]{11})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    raise ValueError("Could not extract video ID from URL")
+
+
+def get_transcript(video_id: str) -> str:
+    try:
+        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+        return " ".join(chunk["text"] for chunk in transcript_list)
+    except TranscriptsDisabled:
+        raise HTTPException(status_code=400, detail="Transcripts are disabled for this video.")
+    except NoTranscriptFound:
+        raise HTTPException(status_code=400, detail="No transcript found for this video.")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not fetch transcript: {str(e)}")
+
+
+STYLE_PROMPTS = {
+    "brief": "Summarize this YouTube video transcript in 3-4 sentences. Be concise.",
+    "detailed": "Provide a detailed summary of this YouTube video transcript. Include the main topic, key points, and any important conclusions. Use 2-3 paragraphs.",
+    "bullet": "Summarize this YouTube video transcript as a list of bullet points covering all the key ideas and takeaways.",
+}
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "YouTube Summarizer API is running"}
+
+
+@app.post("/summarize", response_model=SummarizeResponse)
+def summarize(req: SummarizeRequest):
+    try:
+        video_id = extract_video_id(req.url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    transcript = get_transcript(video_id)
+
+    # Gemini 1.5 Flash supports up to 1M tokens, but let's keep it reasonable
+    max_chars = 100000
+    trimmed = transcript[:max_chars]
+    if len(transcript) > max_chars:
+        trimmed += "\n\n[Transcript trimmed due to length]"
+
+    style_prompt = STYLE_PROMPTS.get(req.style, STYLE_PROMPTS["detailed"])
+
+    prompt = f"""{style_prompt}
+
+Here is the transcript:
+
+{trimmed}"""
 
     try:
-        # ✅ Extract video ID
-        video_id = extract_video_id(url)
-
-        if not video_id:
-            raise HTTPException(status_code=400, detail="Invalid YouTube URL")
-
-        # ✅ Get transcript (SERVER SIDE → no CORS)
-        transcript = YouTubeTranscriptApi.get_transcript(video_id)
-        full_text = " ".join([t["text"] for t in transcript])
-
-        prompt = f"""
-Summarize this YouTube transcript.
-
-Return ONLY JSON:
-
-{{
-  "summary": "3-5 sentence summary",
-  "keyPoints": ["point 1", "point 2", "point 3", "point 4", "point 5"],
-  "timestamps": ["0:32 - Topic", "1:45 - Topic", "3:20 - Topic"]
-}}
-
-Transcript:
-{full_text[:12000]}
-"""
-
         response = model.generate_content(prompt)
-        raw = response.text.strip()
-        raw = re.sub(r"```json|```", "", raw).strip()
-
-        parsed = json.loads(raw)
-        return parsed
-
+        summary_text = response.text
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Gemini API error: {str(e)}")
+
+    return SummarizeResponse(
+        title=f"Video {video_id}",
+        video_id=video_id,
+        summary=summary_text,
+        transcript_length=len(transcript),
+    )
