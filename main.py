@@ -39,9 +39,9 @@ def extract_video_id(url: str) -> str:
     raise ValueError("Could not extract video ID from URL")
 
 STYLE_PROMPTS = {
-    "brief": "Summarize this YouTube video in 3-4 sentences. Be concise.",
-    "detailed": "Provide a detailed summary of this YouTube video. Include the main topic, key points, and any important conclusions. Use 2-3 paragraphs.",
-    "bullet": "Summarize this YouTube video as a list of bullet points covering all the key ideas and takeaways.",
+    "brief": "in 3-4 sentences, be concise",
+    "detailed": "in detail — cover the main topic, key points, and conclusions in 2-3 paragraphs",
+    "bullet": "as a bullet point list of all key ideas and takeaways",
 }
 
 @app.get("/")
@@ -62,37 +62,32 @@ def summarize(req: SummarizeRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # Normalize URL
     youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+    style = STYLE_PROMPTS.get(req.style, STYLE_PROMPTS["detailed"])
 
-    style_prompt = STYLE_PROMPTS.get(req.style, STYLE_PROMPTS["detailed"])
+    prompt = f"""Please watch this YouTube video and summarize it {style}.
 
-    prompt = f"""{style_prompt}
+Video URL: {youtube_url}
 
-Also provide the video title on the very first line in this exact format:
+At the very start of your response, write the video title on its own line in this format:
 TITLE: <title here>
 
-Then on a new line, give the summary."""
+Then write the summary on the next line."""
 
     try:
-        # Gemini 1.5 natively understands YouTube URLs — no transcript needed
-        response = model.generate_content([
-            {"role": "user", "parts": [
-                {"text": prompt},
-                {"file_data": {"mime_type": "video/mp4", "file_uri": youtube_url}}
-            ]}
-        ])
-        full_text = response.text
+        response = model.generate_content(prompt)
+        full_text = response.text.strip()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gemini API error: {str(e)}")
 
-    # Extract title from response
+    # Parse title out of response
     title = f"Video {video_id}"
     summary_text = full_text
-    if full_text.startswith("TITLE:"):
-        lines = full_text.split("\n", 2)
-        title = lines[0].replace("TITLE:", "").strip()
-        summary_text = "\n".join(lines[1:]).strip()
+    for line in full_text.splitlines():
+        if line.strip().upper().startswith("TITLE:"):
+            title = line.split(":", 1)[1].strip()
+            summary_text = full_text.replace(line, "").strip()
+            break
 
     return SummarizeResponse(
         title=title,
