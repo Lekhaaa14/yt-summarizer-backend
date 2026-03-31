@@ -1,5 +1,5 @@
 fastapi
 uvicorn[standard]
-youtube-transcript-api
+youtube-transcript-api==0.6.3
 google-generativeai
 pydantic
