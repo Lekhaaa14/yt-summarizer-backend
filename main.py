@@ -1,8 +1,8 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 import google.generativeai as genai
+import yt_dlp
 import os
 import re
 
@@ -11,22 +11,16 @@ app = FastAPI(title="YouTube Summarizer API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Replace with your frontend URL in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Gemini setup ---
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-model = genai.GenerativeModel("gemini-1.5-flash")
-
-
 # --- Schemas ---
 class SummarizeRequest(BaseModel):
     url: str
     style: str = "detailed"  # "brief", "detailed", "bullet"
-
 
 class SummarizeResponse(BaseModel):
     title: str
@@ -34,26 +28,78 @@ class SummarizeResponse(BaseModel):
     summary: str
     transcript_length: int
 
-
 # --- Helpers ---
+def get_gemini_model():
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY not configured on server.")
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel("gemini-1.5-flash")
+
 def extract_video_id(url: str) -> str:
     match = re.search(r"(?:v=|youtu\.be/|embed/|shorts/)([a-zA-Z0-9_-]{11})", url)
     if match:
         return match.group(1)
     raise ValueError("Could not extract video ID from URL")
 
-
 def get_transcript(video_id: str) -> str:
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    ydl_opts = {
+        "skip_download": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "subtitleslangs": ["en"],
+        "subtitlesformat": "ttml",
+        "quiet": True,
+        "no_warnings": True,
+    }
+
     try:
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
-        return " ".join(chunk["text"] for chunk in transcript_list)
-    except TranscriptsDisabled:
-        raise HTTPException(status_code=400, detail="Transcripts are disabled for this video.")
-    except NoTranscriptFound:
-        raise HTTPException(status_code=400, detail="No transcript found for this video.")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+            # Try manual captions first, then auto-generated
+            subtitles = info.get("subtitles", {})
+            auto_captions = info.get("automatic_captions", {})
+
+            captions = subtitles.get("en") or auto_captions.get("en")
+            if not captions:
+                # Try other English variants like en-US, en-GB
+                for key in list(subtitles.keys()) + list(auto_captions.keys()):
+                    if key.startswith("en"):
+                        captions = subtitles.get(key) or auto_captions.get(key)
+                        break
+
+            if not captions:
+                raise HTTPException(status_code=400, detail="No English transcript available for this video.")
+
+            # Get the JSON3 format which is easiest to parse
+            json3_url = next((c["url"] for c in captions if c.get("ext") == "json3"), None)
+            if not json3_url:
+                # Fall back to any available format url
+                json3_url = captions[0]["url"]
+
+            import urllib.request, json
+            with urllib.request.urlopen(json3_url) as resp:
+                data = json.loads(resp.read().decode())
+
+            # Extract plain text from json3 format
+            lines = []
+            for event in data.get("events", []):
+                for seg in event.get("segs", []):
+                    text = seg.get("utf8", "").strip()
+                    if text and text != "\n":
+                        lines.append(text)
+
+            transcript = " ".join(lines).strip()
+            if not transcript:
+                raise HTTPException(status_code=400, detail="Transcript is empty for this video.")
+            return transcript
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not fetch transcript: {str(e)}")
-
 
 STYLE_PROMPTS = {
     "brief": "Summarize this YouTube video transcript in 3-4 sentences. Be concise.",
@@ -61,22 +107,20 @@ STYLE_PROMPTS = {
     "bullet": "Summarize this YouTube video transcript as a list of bullet points covering all the key ideas and takeaways.",
 }
 
-
 # --- Routes ---
 @app.get("/")
 def root():
     return {"status": "ok", "message": "YouTube Summarizer API is running"}
 
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-
-# Both /api/summarize (v0 frontend default) and /summarize (legacy)
 @app.post("/api/summarize", response_model=SummarizeResponse)
 @app.post("/summarize", response_model=SummarizeResponse)
 def summarize(req: SummarizeRequest):
+    model = get_gemini_model()
+
     try:
         video_id = extract_video_id(req.url)
     except ValueError as e:
