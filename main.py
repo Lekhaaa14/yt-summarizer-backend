@@ -5,10 +5,12 @@ import os, json, re
 
 app = FastAPI()
 
-# ✅ CORS (IMPORTANT)
+# ✅ CORS FIX (IMPORTANT)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://yt-summarizer-frontend-qvcytp7kc-lekhaaa14s-projects.vercel.app"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -23,7 +25,7 @@ model = genai.GenerativeModel("gemini-1.5-flash")
 def root():
     return {"status": "YouTube Summarizer API is running"}
 
-# ✅ Summarize API (FIXED)
+# ✅ Summarize API
 @app.post("/api/summarize")
 async def summarize(body: dict):
     url = body.get("url", "")
@@ -31,7 +33,6 @@ async def summarize(body: dict):
     if not url:
         raise HTTPException(status_code=400, detail="No URL provided")
 
-    # 👉 TEMP: Use URL directly (no transcript extraction yet)
     prompt = f"""
 You are a YouTube video summarizer.
 
