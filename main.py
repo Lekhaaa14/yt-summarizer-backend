@@ -6,7 +6,9 @@ import os
 import re
 import json
 import urllib.request
-import urllib.parse
+import urllib.error
+import time
+import random
 
 app = FastAPI(title="YouTube Summarizer API")
 
@@ -30,6 +32,51 @@ class SummarizeResponse(BaseModel):
     timestamps: list[str]
     transcript_length: int
 
+# Rotate user agents to avoid rate limiting
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+]
+
+def get_headers():
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+def fetch_url(url: str, retries: int = 3, timeout: int = 15) -> str:
+    """Fetch a URL with retry + backoff on 429."""
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, headers=get_headers())
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+                # Handle gzip if needed
+                try:
+                    import gzip
+                    return gzip.decompress(raw).decode("utf-8", errors="replace")
+                except Exception:
+                    return raw.decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                wait = (2 ** attempt) + random.uniform(1, 3)
+                time.sleep(wait)
+                continue
+            raise
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+    raise HTTPException(status_code=429, detail="YouTube is rate-limiting this server. Please wait a minute and try again.")
+
 def get_gemini_model():
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -51,41 +98,34 @@ def extract_video_id(url: str) -> str:
     raise ValueError("Could not extract video ID from URL")
 
 def fetch_transcript(video_id: str) -> tuple[str, str]:
-    """
-    Fetch transcript using YouTube's Innertube API.
-    Returns (transcript_text, video_title).
-    Works without OAuth or API key.
-    """
-    # Step 1: Get video metadata + caption tracks via Innertube
-    innertube_url = "https://www.youtube.com/youtubei/v1/get_transcript"
-    
-    # First get the video page to extract the serialized share entity
+    """Fetch transcript + title from YouTube page source."""
     video_url = f"https://www.youtube.com/watch?v={video_id}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
 
-    req = urllib.request.Request(video_url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
+        html = fetch_url(video_url)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not load video page: {str(e)}")
 
-    # Extract video title
-    title_match = re.search(r'"title":"([^"]+)"', html)
-    title = title_match.group(1) if title_match else f"Video {video_id}"
-    # Clean unicode escapes
-    title = title.encode().decode("unicode_escape", errors="replace")
+    # Extract title
+    title = f"Video {video_id}"
+    for pattern in [r'<title>([^<]+)</title>', r'"title":"([^"]{5,100})"']:
+        m = re.search(pattern, html)
+        if m:
+            title = m.group(1).replace(" - YouTube", "").strip()
+            try:
+                title = title.encode().decode("unicode_escape", errors="replace")
+            except Exception:
+                pass
+            break
 
-    # Extract caption tracks from page source
+    # Extract caption tracks
     caption_match = re.search(r'"captionTracks":(\[.*?\])', html)
     if not caption_match:
         raise HTTPException(
             status_code=400,
-            detail="No captions/transcript available for this video. The video may not have subtitles enabled."
+            detail="No captions available for this video. It may not have subtitles enabled."
         )
 
     try:
@@ -96,60 +136,54 @@ def fetch_transcript(video_id: str) -> tuple[str, str]:
     if not caption_tracks:
         raise HTTPException(status_code=400, detail="No caption tracks found for this video.")
 
-    # Pick best track: prefer English, then English auto-generated, then first available
+    # Pick best track: manual English > auto English > any English > first available
     selected = None
-    for track in caption_tracks:
-        lang = track.get("languageCode", "")
-        kind = track.get("kind", "")
-        if lang == "en" and kind != "asr":  # manual English captions
-            selected = track
-            break
-    if not selected:
+    for kind_filter in [
+        lambda t: t.get("languageCode", "").startswith("en") and t.get("kind") != "asr",
+        lambda t: t.get("languageCode", "").startswith("en"),
+        lambda t: True,
+    ]:
         for track in caption_tracks:
-            if track.get("languageCode", "").startswith("en"):  # auto-generated English
+            if kind_filter(track):
                 selected = track
                 break
-    if not selected:
-        selected = caption_tracks[0]  # any language as fallback
+        if selected:
+            break
 
     base_url = selected.get("baseUrl", "")
     if not base_url:
         raise HTTPException(status_code=400, detail="Caption URL not found.")
 
-    # Add fmt=json3 for easy parsing
-    if "fmt=" not in base_url:
-        base_url += "&fmt=json3"
-    else:
+    # Request JSON3 format
+    if "fmt=" in base_url:
         base_url = re.sub(r"fmt=[^&]+", "fmt=json3", base_url)
+    else:
+        base_url += "&fmt=json3"
 
-    # Fetch the transcript
-    req2 = urllib.request.Request(base_url, headers=headers)
     try:
-        with urllib.request.urlopen(req2, timeout=15) as resp:
-            content = resp.read().decode("utf-8", errors="replace")
+        content = fetch_url(base_url)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not fetch transcript data: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Could not fetch transcript: {str(e)}")
 
     try:
         data = json.loads(content)
     except Exception:
-        raise HTTPException(status_code=400, detail="Could not parse transcript data.")
+        raise HTTPException(status_code=400, detail="Could not parse transcript JSON.")
 
-    # Build transcript with timestamps
     lines = []
     for event in data.get("events", []):
         start_ms = event.get("tStartMs", 0)
-        segs = event.get("segs", [])
-        text = "".join(s.get("utf8", "") for s in segs).strip()
+        text = "".join(s.get("utf8", "") for s in event.get("segs", [])).strip()
         if text and text != "\n":
-            # Convert ms to MM:SS
             total_secs = int(start_ms / 1000)
             mins, secs = divmod(total_secs, 60)
             lines.append(f"[{mins:02d}:{secs:02d}] {text}")
 
     transcript = "\n".join(lines)
     if not transcript.strip():
-        raise HTTPException(status_code=400, detail="Transcript is empty.")
+        raise HTTPException(status_code=400, detail="Transcript is empty for this video.")
 
     return transcript, title
 
@@ -172,48 +206,33 @@ def summarize(req: SummarizeRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # Fetch real transcript from YouTube
     transcript, video_title = fetch_transcript(video_id)
 
-    # Trim if too long (keep ~80k chars which is ~20k tokens)
     max_chars = 80000
-    trimmed_transcript = transcript[:max_chars]
+    trimmed = transcript[:max_chars]
     if len(transcript) > max_chars:
-        trimmed_transcript += "\n[Transcript trimmed due to length]"
+        trimmed += "\n[Transcript trimmed]"
 
     prompt = f"""You are an expert content analyst. Below is the real timestamped transcript of a YouTube video titled "{video_title}".
 
-Analyze the transcript carefully and return a JSON object summarizing the video accurately.
+Analyze it carefully and return a JSON summary.
 
 TRANSCRIPT:
-{trimmed_transcript}
+{trimmed}
 
 Rules:
-- Base your summary ONLY on the transcript above — do not guess or hallucinate
-- Summary must be 4-5 complete paragraphs, covering the full video from start to finish
-- Every sentence must be complete — never cut off mid-sentence
-- keyPoints must be specific, standalone insights from the actual content
-- For timestamps, use the [MM:SS] markers from the transcript to identify real topic changes
+- Base summary ONLY on the transcript — do not hallucinate
+- Write 4-5 complete paragraphs covering the full video
+- Never cut off mid-sentence
+- keyPoints must be specific insights from the actual content
+- Use [MM:SS] markers from transcript for accurate timestamps
 
-Return this exact JSON:
+Return this JSON:
 {{
   "title": "{video_title}",
-  "summary": "4-5 complete paragraphs summarizing the full video accurately based on the transcript",
-  "keyPoints": [
-    "Specific insight 1 from the video",
-    "Specific insight 2 from the video",
-    "Specific insight 3 from the video",
-    "Specific insight 4 from the video",
-    "Specific insight 5 from the video",
-    "Specific insight 6 from the video"
-  ],
-  "timestamps": [
-    "00:00 - Introduction",
-    "MM:SS - Topic",
-    "MM:SS - Topic",
-    "MM:SS - Topic",
-    "MM:SS - Conclusion"
-  ]
+  "summary": "4-5 complete paragraphs summarizing the full video",
+  "keyPoints": ["point 1", "point 2", "point 3", "point 4", "point 5", "point 6"],
+  "timestamps": ["00:00 - Intro", "MM:SS - Topic", "MM:SS - Topic", "MM:SS - Conclusion"]
 }}"""
 
     try:
@@ -224,19 +243,14 @@ Return this exact JSON:
 
     raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
     raw = re.sub(r"\s*```\s*$", "", raw, flags=re.MULTILINE)
-    raw = raw.strip()
 
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-        if json_match:
-            try:
-                data = json.loads(json_match.group())
-            except Exception:
-                data = {"title": video_title, "summary": raw, "keyPoints": [], "timestamps": []}
-        else:
-            data = {"title": video_title, "summary": raw, "keyPoints": [], "timestamps": []}
+        data = json.loads(raw.strip())
+    except Exception:
+        m = re.search(r'\{.*\}', raw, re.DOTALL)
+        data = json.loads(m.group()) if m else {
+            "title": video_title, "summary": raw, "keyPoints": [], "timestamps": []
+        }
 
     return SummarizeResponse(
         title=data.get("title", video_title),
