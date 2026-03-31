@@ -5,32 +5,40 @@ import os, json, re
 
 app = FastAPI()
 
-# ✅ CORS
+# ✅ CORS (IMPORTANT)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ✅ Gemini API
+# ✅ Gemini API setup
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 model = genai.GenerativeModel("gemini-1.5-flash")
 
+# ✅ Root route
 @app.get("/")
 def root():
     return {"status": "YouTube Summarizer API is running"}
 
-# ✅ NEW: Summarize using transcript text (NOT URL)
+# ✅ Summarize API (FIXED)
 @app.post("/api/summarize")
 async def summarize(body: dict):
-    text = body.get("text", "")
+    url = body.get("url", "")
 
-    if not text:
-        raise HTTPException(status_code=400, detail="No transcript provided")
+    if not url:
+        raise HTTPException(status_code=400, detail="No URL provided")
 
+    # 👉 TEMP: Use URL directly (no transcript extraction yet)
     prompt = f"""
-You are a YouTube video summarizer. Analyze this transcript and respond ONLY with valid JSON.
+You are a YouTube video summarizer.
+
+Summarize the content of this YouTube video:
+{url}
+
+Return ONLY valid JSON in this format:
 
 {{
   "summary": "3-5 sentence summary",
@@ -47,15 +55,13 @@ You are a YouTube video summarizer. Analyze this transcript and respond ONLY wit
     "3:20 - Topic"
   ]
 }}
-
-Transcript:
-{text[:12000]}
 """
 
     try:
         response = model.generate_content(prompt)
         raw = response.text.strip()
 
+        # ✅ Clean response
         raw = re.sub(r"```json|```", "", raw).strip()
 
         parsed = json.loads(raw)
