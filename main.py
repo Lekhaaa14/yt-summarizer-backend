@@ -5,6 +5,8 @@ import google.generativeai as genai
 import os
 import re
 import json
+import urllib.request
+import urllib.parse
 
 app = FastAPI(title="YouTube Summarizer API")
 
@@ -38,7 +40,7 @@ def get_gemini_model():
         generation_config=genai.GenerationConfig(
             temperature=0.2,
             max_output_tokens=3000,
-            response_mime_type="application/json",  # force JSON output
+            response_mime_type="application/json",
         )
     )
 
@@ -47,6 +49,110 @@ def extract_video_id(url: str) -> str:
     if match:
         return match.group(1)
     raise ValueError("Could not extract video ID from URL")
+
+def fetch_transcript(video_id: str) -> tuple[str, str]:
+    """
+    Fetch transcript using YouTube's Innertube API.
+    Returns (transcript_text, video_title).
+    Works without OAuth or API key.
+    """
+    # Step 1: Get video metadata + caption tracks via Innertube
+    innertube_url = "https://www.youtube.com/youtubei/v1/get_transcript"
+    
+    # First get the video page to extract the serialized share entity
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
+    req = urllib.request.Request(video_url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not load video page: {str(e)}")
+
+    # Extract video title
+    title_match = re.search(r'"title":"([^"]+)"', html)
+    title = title_match.group(1) if title_match else f"Video {video_id}"
+    # Clean unicode escapes
+    title = title.encode().decode("unicode_escape", errors="replace")
+
+    # Extract caption tracks from page source
+    caption_match = re.search(r'"captionTracks":(\[.*?\])', html)
+    if not caption_match:
+        raise HTTPException(
+            status_code=400,
+            detail="No captions/transcript available for this video. The video may not have subtitles enabled."
+        )
+
+    try:
+        caption_tracks = json.loads(caption_match.group(1))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not parse caption data.")
+
+    if not caption_tracks:
+        raise HTTPException(status_code=400, detail="No caption tracks found for this video.")
+
+    # Pick best track: prefer English, then English auto-generated, then first available
+    selected = None
+    for track in caption_tracks:
+        lang = track.get("languageCode", "")
+        kind = track.get("kind", "")
+        if lang == "en" and kind != "asr":  # manual English captions
+            selected = track
+            break
+    if not selected:
+        for track in caption_tracks:
+            if track.get("languageCode", "").startswith("en"):  # auto-generated English
+                selected = track
+                break
+    if not selected:
+        selected = caption_tracks[0]  # any language as fallback
+
+    base_url = selected.get("baseUrl", "")
+    if not base_url:
+        raise HTTPException(status_code=400, detail="Caption URL not found.")
+
+    # Add fmt=json3 for easy parsing
+    if "fmt=" not in base_url:
+        base_url += "&fmt=json3"
+    else:
+        base_url = re.sub(r"fmt=[^&]+", "fmt=json3", base_url)
+
+    # Fetch the transcript
+    req2 = urllib.request.Request(base_url, headers=headers)
+    try:
+        with urllib.request.urlopen(req2, timeout=15) as resp:
+            content = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not fetch transcript data: {str(e)}")
+
+    try:
+        data = json.loads(content)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not parse transcript data.")
+
+    # Build transcript with timestamps
+    lines = []
+    for event in data.get("events", []):
+        start_ms = event.get("tStartMs", 0)
+        segs = event.get("segs", [])
+        text = "".join(s.get("utf8", "") for s in segs).strip()
+        if text and text != "\n":
+            # Convert ms to MM:SS
+            total_secs = int(start_ms / 1000)
+            mins, secs = divmod(total_secs, 60)
+            lines.append(f"[{mins:02d}:{secs:02d}] {text}")
+
+    transcript = "\n".join(lines)
+    if not transcript.strip():
+        raise HTTPException(status_code=400, detail="Transcript is empty.")
+
+    return transcript, title
+
 
 @app.get("/")
 def root():
@@ -66,37 +172,46 @@ def summarize(req: SummarizeRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+    # Fetch real transcript from YouTube
+    transcript, video_title = fetch_transcript(video_id)
 
-    prompt = f"""Analyze this YouTube video completely and return a JSON object.
+    # Trim if too long (keep ~80k chars which is ~20k tokens)
+    max_chars = 80000
+    trimmed_transcript = transcript[:max_chars]
+    if len(transcript) > max_chars:
+        trimmed_transcript += "\n[Transcript trimmed due to length]"
 
-Video URL: {youtube_url}
+    prompt = f"""You are an expert content analyst. Below is the real timestamped transcript of a YouTube video titled "{video_title}".
+
+Analyze the transcript carefully and return a JSON object summarizing the video accurately.
+
+TRANSCRIPT:
+{trimmed_transcript}
 
 Rules:
-- Watch the FULL video before summarizing
-- If the video language is not English, translate and summarize in English
-- The summary must be COMPLETE — do not cut off mid-sentence. Cover the entire video from start to finish.
-- Be specific and informative — mention actual concepts, tools, techniques, or arguments from the video
-- keyPoints must be standalone insights a viewer would find valuable even without watching
-- Timestamps must reflect the actual video structure with accurate time markers
+- Base your summary ONLY on the transcript above — do not guess or hallucinate
+- Summary must be 4-5 complete paragraphs, covering the full video from start to finish
+- Every sentence must be complete — never cut off mid-sentence
+- keyPoints must be specific, standalone insights from the actual content
+- For timestamps, use the [MM:SS] markers from the transcript to identify real topic changes
 
-Return this exact JSON schema:
+Return this exact JSON:
 {{
-  "title": "exact video title",
-  "summary": "Write 4-5 full paragraphs covering: (1) what the video is about and its goal, (2) the main content and techniques covered in the first half, (3) the main content covered in the second half, (4) specific examples, demos, or case studies shown, (5) final conclusions and recommendations from the creator. Every sentence must be complete. Do not truncate.",
+  "title": "{video_title}",
+  "summary": "4-5 complete paragraphs summarizing the full video accurately based on the transcript",
   "keyPoints": [
-    "Complete, specific key point 1",
-    "Complete, specific key point 2",
-    "Complete, specific key point 3",
-    "Complete, specific key point 4",
-    "Complete, specific key point 5",
-    "Complete, specific key point 6"
+    "Specific insight 1 from the video",
+    "Specific insight 2 from the video",
+    "Specific insight 3 from the video",
+    "Specific insight 4 from the video",
+    "Specific insight 5 from the video",
+    "Specific insight 6 from the video"
   ],
   "timestamps": [
     "00:00 - Introduction",
-    "MM:SS - Topic name",
-    "MM:SS - Topic name",
-    "MM:SS - Topic name",
+    "MM:SS - Topic",
+    "MM:SS - Topic",
+    "MM:SS - Topic",
     "MM:SS - Conclusion"
   ]
 }}"""
@@ -107,7 +222,6 @@ Return this exact JSON schema:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gemini API error: {str(e)}")
 
-    # Clean up any markdown fences just in case
     raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
     raw = re.sub(r"\s*```\s*$", "", raw, flags=re.MULTILINE)
     raw = raw.strip()
@@ -115,21 +229,20 @@ Return this exact JSON schema:
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
-        # Try to extract JSON object from the response if there's extra text
         json_match = re.search(r'\{.*\}', raw, re.DOTALL)
         if json_match:
             try:
                 data = json.loads(json_match.group())
             except Exception:
-                data = {"title": f"Video {video_id}", "summary": raw, "keyPoints": [], "timestamps": []}
+                data = {"title": video_title, "summary": raw, "keyPoints": [], "timestamps": []}
         else:
-            data = {"title": f"Video {video_id}", "summary": raw, "keyPoints": [], "timestamps": []}
+            data = {"title": video_title, "summary": raw, "keyPoints": [], "timestamps": []}
 
     return SummarizeResponse(
-        title=data.get("title", f"Video {video_id}"),
+        title=data.get("title", video_title),
         video_id=video_id,
         summary=data.get("summary", ""),
         keyPoints=data.get("keyPoints", []),
         timestamps=data.get("timestamps", []),
-        transcript_length=len(raw),
+        transcript_length=len(transcript),
     )
