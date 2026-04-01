@@ -89,8 +89,8 @@ def summarize(req: SummarizeRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    if not req.transcript or len(req.transcript.strip()) < 50:
-        raise HTTPException(status_code=400, detail="Transcript is empty or too short.")
+    if not req.transcript or len(req.transcript.strip()) < 10:
+        raise HTTPException(status_code=400, detail=f"Could not get transcript content (length: {len(req.transcript.strip())}). The video may have no speech or be too short.")
 
     max_chars = 80000
     trimmed = req.transcript[:max_chars]
