@@ -50,7 +50,7 @@ def extract_video_id(url: str) -> str:
     raise ValueError("Could not extract video ID from URL")
 
 def extract_json(text: str) -> dict:
-    """Robustly extract JSON from Gemini response."""
+    """Robustly extract JSON from Gemini response, handling all fence/leak cases."""
     text = text.strip()
     # Strip markdown fences
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
@@ -61,11 +61,12 @@ def extract_json(text: str) -> dict:
         return json.loads(text)
     except Exception:
         pass
-    # Find first { ... } block
-    match = re.search(r'\{[\s\S]*\}', text)
-    if match:
+    # Find from first { to last } (handles trailing text)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
         try:
-            return json.loads(match.group())
+            return json.loads(text[start:end+1])
         except Exception:
             pass
     return {}
@@ -140,13 +141,24 @@ Return ONLY valid JSON in this exact format (no markdown, no extra text):
     data = extract_json(raw)
 
     if not data.get("summary"):
-        # If JSON extraction failed entirely, return raw as summary
-        data = {
-            "title": f"Video {video_id}",
-            "summary": raw,
-            "keyPoints": [],
-            "timestamps": []
-        }
+        # JSON extraction failed — try one more time with a simpler approach
+        try:
+            # Sometimes Gemini wraps in extra text before/after JSON
+            json_match = re.search(r'\{.*?"summary".*?\}', raw, re.DOTALL)
+            if json_match:
+                data = json.loads(json_match.group())
+        except Exception:
+            pass
+        # If still no summary, use raw text but clean it up
+        if not data.get("summary"):
+            clean = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
+            clean = re.sub(r'\s*```\s*$', '', clean, flags=re.MULTILINE).strip()
+            data = {
+                "title": f"Video {video_id}",
+                "summary": clean,
+                "keyPoints": [],
+                "timestamps": []
+            }
 
     return SummarizeResponse(
         title=data.get("title", f"Video {video_id}"),
