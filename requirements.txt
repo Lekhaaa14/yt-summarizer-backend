@@ -1,5 +1,4 @@
 fastapi
 uvicorn[standard]
-google-generativeai
+google-genai
 pydantic
-yt-dlp
