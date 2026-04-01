@@ -18,7 +18,7 @@ app.add_middleware(
 
 class SummarizeRequest(BaseModel):
     url: str
-    transcript: str
+    transcript: str = ""
     style: str = "detailed"
 
 class SummarizeResponse(BaseModel):
@@ -34,7 +34,6 @@ def get_gemini_model():
     if not api_key:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY not configured.")
     genai.configure(api_key=api_key)
-    # No response_mime_type — let Gemini output freely, we parse manually
     return genai.GenerativeModel(
         "gemini-2.5-flash",
         generation_config=genai.GenerationConfig(
@@ -50,18 +49,14 @@ def extract_video_id(url: str) -> str:
     raise ValueError("Could not extract video ID from URL")
 
 def extract_json(text: str) -> dict:
-    """Robustly extract JSON from Gemini response, handling all fence/leak cases."""
     text = text.strip()
-    # Strip markdown fences
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
     text = re.sub(r"\s*```\s*$", "", text, flags=re.MULTILINE)
     text = text.strip()
-    # Direct parse
     try:
         return json.loads(text)
     except Exception:
         pass
-    # Find from first { to last } (handles trailing text)
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end > start:
@@ -70,6 +65,13 @@ def extract_json(text: str) -> dict:
         except Exception:
             pass
     return {}
+
+JSON_FORMAT = '''{
+  "title": "video title",
+  "summary": "detailed summary",
+  "keyPoints": ["point 1", "point 2", "point 3", "point 4", "point 5", "point 6"],
+  "timestamps": ["00:00 - Intro", "MM:SS - Topic", "MM:SS - Topic", "MM:SS - End"]
+}'''
 
 @app.get("/")
 def root():
@@ -89,47 +91,53 @@ def summarize(req: SummarizeRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    if not req.transcript or len(req.transcript.strip()) < 10:
-        raise HTTPException(status_code=400, detail=f"Could not get transcript content (length: {len(req.transcript.strip())}). The video may have no speech or be too short.")
+    youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+    transcript = (req.transcript or "").strip()
+    has_transcript = len(transcript) > 50
 
-    max_chars = 80000
-    trimmed = req.transcript[:max_chars]
-
-    prompt = f"""You are an expert content analyst. Analyze this YouTube video transcript and return a structured JSON summary.
+    if has_transcript:
+        # Use real transcript — most accurate
+        trimmed = transcript[:80000]
+        prompt = f"""You are an expert content analyst. Analyze this YouTube video transcript and return a JSON summary.
 
 TRANSCRIPT:
 {trimmed}
 
-INSTRUCTIONS:
-- Base your response ONLY on the transcript content above
-- Be specific — mention actual tools, concepts, techniques, examples from the video
-- The summary must cover the ENTIRE video from start to finish in detail
-- Every sentence must be complete — never truncate mid-sentence
-- keyPoints should be organized thematically (group related points together)
-- Timestamps should reflect real topic transitions in the video
-
-Return ONLY valid JSON in this exact format (no markdown, no extra text):
+Return ONLY valid JSON, no markdown fences, no extra text:
 {{
-  "title": "exact or inferred video title",
-  "summary": "Write a thorough 5-paragraph summary:\n- Para 1: What the video is about, who it's for, and its main goal\n- Para 2: First major section covered (specific topics, tools, examples)\n- Para 3: Middle sections covered in detail\n- Para 4: Later sections and advanced topics\n- Para 5: Final conclusions, recommendations, and overall takeaways",
+  "title": "infer the video title from the transcript",
+  "summary": "Write 5 complete paragraphs: (1) what the video is about and its goal, (2) first major section with specific details, (3) middle sections in detail, (4) later/advanced topics, (5) conclusions and key takeaways. Never truncate mid-sentence.",
   "keyPoints": [
-    "Topic category 1 — specific detail from video",
-    "Topic category 2 — specific detail from video",
-    "Topic category 3 — specific detail from video",
-    "Topic category 4 — specific detail from video",
-    "Topic category 5 — specific detail from video",
-    "Topic category 6 — specific detail from video",
-    "Topic category 7 — specific detail from video",
-    "Topic category 8 — specific detail from video"
+    "Specific insight 1 from the video",
+    "Specific insight 2 from the video",
+    "Specific insight 3 from the video",
+    "Specific insight 4 from the video",
+    "Specific insight 5 from the video",
+    "Specific insight 6 from the video",
+    "Specific insight 7 from the video",
+    "Specific insight 8 from the video"
   ],
-  "timestamps": [
-    "00:00 - Introduction and overview",
-    "MM:SS - Topic name",
-    "MM:SS - Topic name",
-    "MM:SS - Topic name",
-    "MM:SS - Topic name",
-    "MM:SS - Conclusion"
-  ]
+  "timestamps": ["00:00 - Introduction", "MM:SS - Topic", "MM:SS - Topic", "MM:SS - Topic", "MM:SS - Conclusion"]
+}}"""
+    else:
+        # No transcript — Gemini watches the video visually
+        prompt = f"""You are an expert video analyst. Watch this YouTube video carefully and return a JSON summary of what you see and hear.
+
+Video URL: {youtube_url}
+
+Watch the FULL video. Describe exactly what happens — actions, scenes, people, objects, dialogue, humor, or key moments. Be specific, not generic.
+
+Return ONLY valid JSON, no markdown fences, no extra text:
+{{
+  "title": "the actual video title",
+  "summary": "Write 3-4 paragraphs describing exactly what happens in the video from start to finish. Mention specific visual details, actions, and moments.",
+  "keyPoints": [
+    "Specific thing that happens 1",
+    "Specific thing that happens 2",
+    "Specific thing that happens 3",
+    "Specific thing that happens 4"
+  ],
+  "timestamps": ["00:00 - Start", "MM:SS - Event", "MM:SS - Event", "MM:SS - End"]
 }}"""
 
     try:
@@ -141,24 +149,14 @@ Return ONLY valid JSON in this exact format (no markdown, no extra text):
     data = extract_json(raw)
 
     if not data.get("summary"):
-        # JSON extraction failed — try one more time with a simpler approach
-        try:
-            # Sometimes Gemini wraps in extra text before/after JSON
-            json_match = re.search(r'\{.*?"summary".*?\}', raw, re.DOTALL)
-            if json_match:
-                data = json.loads(json_match.group())
-        except Exception:
-            pass
-        # If still no summary, use raw text but clean it up
-        if not data.get("summary"):
-            clean = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.MULTILINE)
-            clean = re.sub(r'\s*```\s*$', '', clean, flags=re.MULTILINE).strip()
-            data = {
-                "title": f"Video {video_id}",
-                "summary": clean,
-                "keyPoints": [],
-                "timestamps": []
-            }
+        clean = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+        clean = re.sub(r"\s*```\s*$", "", clean, flags=re.MULTILINE).strip()
+        data = {
+            "title": f"Video {video_id}",
+            "summary": clean,
+            "keyPoints": [],
+            "timestamps": []
+        }
 
     return SummarizeResponse(
         title=data.get("title", f"Video {video_id}"),
@@ -166,5 +164,5 @@ Return ONLY valid JSON in this exact format (no markdown, no extra text):
         summary=data.get("summary", ""),
         keyPoints=data.get("keyPoints", []),
         timestamps=data.get("timestamps", []),
-        transcript_length=len(req.transcript),
+        transcript_length=len(transcript),
     )
