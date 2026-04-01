@@ -8,9 +8,10 @@ import json
 
 app = FastAPI(title="YouTube Summarizer API")
 
+# Setup CORS for your Vercel frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # For production, replace with your Vercel URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -33,53 +34,28 @@ def get_gemini_model():
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY not configured.")
+    
     genai.configure(api_key=api_key)
+    
+    # Using 1.5-flash as it is more stable for JSON tasks than 2.0-experimental/flash in some regions
     return genai.GenerativeModel(
-        "gemini-2.5-flash",
-        generation_config=genai.GenerationConfig(
-            temperature=0.3,
-            max_output_tokens=4096,
-        )
+        "gemini-1.5-flash", 
+        generation_config={
+            "temperature": 0.1,  # Lower temperature reduces hallucination
+            "max_output_tokens": 4096,
+            "response_mime_type": "application/json", # Forces Gemini to return valid JSON
+        }
     )
 
 def extract_video_id(url: str) -> str:
     match = re.search(r"(?:v=|youtu\.be/|embed/|shorts/)([a-zA-Z0-9_-]{11})", url)
     if match:
         return match.group(1)
-    raise ValueError("Could not extract video ID from URL")
-
-def extract_json(text: str) -> dict:
-    text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
-    text = re.sub(r"\s*```\s*$", "", text, flags=re.MULTILINE)
-    text = text.strip()
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end > start:
-        try:
-            return json.loads(text[start:end+1])
-        except Exception:
-            pass
-    return {}
-
-JSON_FORMAT = '''{
-  "title": "video title",
-  "summary": "detailed summary",
-  "keyPoints": ["point 1", "point 2", "point 3", "point 4", "point 5", "point 6"],
-  "timestamps": ["00:00 - Intro", "MM:SS - Topic", "MM:SS - Topic", "MM:SS - End"]
-}'''
+    raise ValueError("Invalid YouTube URL")
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "YouTube Summarizer API is running"}
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+    return {"status": "ok", "message": "Backend is live"}
 
 @app.post("/api/summarize", response_model=SummarizeResponse)
 @app.post("/summarize", response_model=SummarizeResponse)
@@ -91,77 +67,51 @@ def summarize(req: SummarizeRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    youtube_url = f"https://www.youtube.com/watch?v={video_id}"
     transcript = (req.transcript or "").strip()
-    has_transcript = len(transcript) > 50
+    
+    # --- CRITICAL FIX: GATEKEEPER ---
+    # If no transcript is provided, we stop here to prevent hallucination and save quota.
+    if len(transcript) < 100:
+        raise HTTPException(
+            status_code=400, 
+            detail="No valid transcript found. This video cannot be summarized without text data."
+        )
 
-    if has_transcript:
-        # Use real transcript — most accurate
-        trimmed = transcript[:80000]
-        prompt = f"""You are an expert content analyst. Analyze this YouTube video transcript and return a JSON summary.
+    # Clean and trim transcript to fit context window
+    trimmed_transcript = transcript[:100000] 
 
-TRANSCRIPT:
-{trimmed}
+    prompt = f"""You are an expert content analyst. Analyze the following YouTube transcript.
+    
+    RULES:
+    1. Base the summary ONLY on the text provided.
+    2. If the transcript is mostly music, gibberish, or 'thank you', state that in the summary.
+    3. Return a valid JSON object.
 
-Return ONLY valid JSON, no markdown fences, no extra text:
-{{
-  "title": "infer the video title from the transcript",
-  "summary": "Write 5 complete paragraphs: (1) what the video is about and its goal, (2) first major section with specific details, (3) middle sections in detail, (4) later/advanced topics, (5) conclusions and key takeaways. Never truncate mid-sentence.",
-  "keyPoints": [
-    "Specific insight 1 from the video",
-    "Specific insight 2 from the video",
-    "Specific insight 3 from the video",
-    "Specific insight 4 from the video",
-    "Specific insight 5 from the video",
-    "Specific insight 6 from the video",
-    "Specific insight 7 from the video",
-    "Specific insight 8 from the video"
-  ],
-  "timestamps": ["00:00 - Introduction", "MM:SS - Topic", "MM:SS - Topic", "MM:SS - Topic", "MM:SS - Conclusion"]
-}}"""
-    else:
-        # No transcript — Gemini watches the video visually
-        prompt = f"""You are an expert video analyst. Watch this YouTube video carefully and return a JSON summary of what you see and hear.
+    TRANSCRIPT:
+    {trimmed_transcript}
 
-Video URL: {youtube_url}
-
-Watch the FULL video. Describe exactly what happens — actions, scenes, people, objects, dialogue, humor, or key moments. Be specific, not generic.
-
-Return ONLY valid JSON, no markdown fences, no extra text:
-{{
-  "title": "the actual video title",
-  "summary": "Write 3-4 paragraphs describing exactly what happens in the video from start to finish. Mention specific visual details, actions, and moments.",
-  "keyPoints": [
-    "Specific thing that happens 1",
-    "Specific thing that happens 2",
-    "Specific thing that happens 3",
-    "Specific thing that happens 4"
-  ],
-  "timestamps": ["00:00 - Start", "MM:SS - Event", "MM:SS - Event", "MM:SS - End"]
-}}"""
+    JSON STRUCTURE:
+    {{
+      "title": "Actual title or inferred subject",
+      "summary": "5 detailed paragraphs explaining the goal, major sections, and conclusions.",
+      "keyPoints": ["At least 7 specific insights"],
+      "timestamps": ["00:00 - Intro", "MM:SS - Topic", "MM:SS - Conclusion"]
+    }}"""
 
     try:
         response = model.generate_content(prompt)
-        raw = response.text.strip()
+        # Because we used response_mime_type: "application/json", we can load directly
+        data = json.loads(response.text)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gemini API error: {str(e)}")
-
-    data = extract_json(raw)
-
-    if not data.get("summary"):
-        clean = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
-        clean = re.sub(r"\s*```\s*$", "", clean, flags=re.MULTILINE).strip()
-        data = {
-            "title": f"Video {video_id}",
-            "summary": clean,
-            "keyPoints": [],
-            "timestamps": []
-        }
+        # Check specifically for quota errors
+        if "429" in str(e) or "quota" in str(e).lower():
+             raise HTTPException(status_code=429, detail="Gemini API daily quota reached. Please try again later.")
+        raise HTTPException(status_code=500, detail=f"AI Processing Error: {str(e)}")
 
     return SummarizeResponse(
         title=data.get("title", f"Video {video_id}"),
         video_id=video_id,
-        summary=data.get("summary", ""),
+        summary=data.get("summary", "No summary generated."),
         keyPoints=data.get("keyPoints", []),
         timestamps=data.get("timestamps", []),
         transcript_length=len(transcript),
