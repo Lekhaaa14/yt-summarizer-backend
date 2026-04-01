@@ -18,7 +18,7 @@ app.add_middleware(
 
 class SummarizeRequest(BaseModel):
     url: str
-    transcript: str  # transcript now sent from frontend
+    transcript: str
     style: str = "detailed"
 
 class SummarizeResponse(BaseModel):
@@ -34,12 +34,12 @@ def get_gemini_model():
     if not api_key:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY not configured.")
     genai.configure(api_key=api_key)
+    # No response_mime_type — let Gemini output freely, we parse manually
     return genai.GenerativeModel(
         "gemini-2.5-flash",
         generation_config=genai.GenerationConfig(
-            temperature=0.2,
-            max_output_tokens=3000,
-            response_mime_type="application/json",
+            temperature=0.3,
+            max_output_tokens=4096,
         )
     )
 
@@ -48,6 +48,27 @@ def extract_video_id(url: str) -> str:
     if match:
         return match.group(1)
     raise ValueError("Could not extract video ID from URL")
+
+def extract_json(text: str) -> dict:
+    """Robustly extract JSON from Gemini response."""
+    text = text.strip()
+    # Strip markdown fences
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\s*```\s*$", "", text, flags=re.MULTILINE)
+    text = text.strip()
+    # Direct parse
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # Find first { ... } block
+    match = re.search(r'\{[\s\S]*\}', text)
+    if match:
+        try:
+            return json.loads(match.group())
+        except Exception:
+            pass
+    return {}
 
 @app.get("/")
 def root():
@@ -72,39 +93,40 @@ def summarize(req: SummarizeRequest):
 
     max_chars = 80000
     trimmed = req.transcript[:max_chars]
-    if len(req.transcript) > max_chars:
-        trimmed += "\n[Transcript trimmed]"
 
-    prompt = f"""You are an expert content analyst. Below is the real transcript of a YouTube video.
-Analyze it and return an accurate JSON summary based ONLY on this transcript.
+    prompt = f"""You are an expert content analyst. Analyze this YouTube video transcript and return a structured JSON summary.
 
 TRANSCRIPT:
 {trimmed}
 
-Rules:
-- Base your answer ONLY on the transcript — no hallucination
-- Write 4-5 complete paragraphs covering the full video from start to finish
-- Every sentence must be complete — never cut off mid-sentence
-- keyPoints must be specific, standalone insights from the actual content
-- Infer approximate timestamps from transcript flow
+INSTRUCTIONS:
+- Base your response ONLY on the transcript content above
+- Be specific — mention actual tools, concepts, techniques, examples from the video
+- The summary must cover the ENTIRE video from start to finish in detail
+- Every sentence must be complete — never truncate mid-sentence
+- keyPoints should be organized thematically (group related points together)
+- Timestamps should reflect real topic transitions in the video
 
-Return this exact JSON:
+Return ONLY valid JSON in this exact format (no markdown, no extra text):
 {{
-  "title": "infer the video title from the transcript content",
-  "summary": "4-5 complete paragraphs summarizing the full video accurately",
+  "title": "exact or inferred video title",
+  "summary": "Write a thorough 5-paragraph summary:\n- Para 1: What the video is about, who it's for, and its main goal\n- Para 2: First major section covered (specific topics, tools, examples)\n- Para 3: Middle sections covered in detail\n- Para 4: Later sections and advanced topics\n- Para 5: Final conclusions, recommendations, and overall takeaways",
   "keyPoints": [
-    "Specific insight 1",
-    "Specific insight 2",
-    "Specific insight 3",
-    "Specific insight 4",
-    "Specific insight 5",
-    "Specific insight 6"
+    "Topic category 1 — specific detail from video",
+    "Topic category 2 — specific detail from video",
+    "Topic category 3 — specific detail from video",
+    "Topic category 4 — specific detail from video",
+    "Topic category 5 — specific detail from video",
+    "Topic category 6 — specific detail from video",
+    "Topic category 7 — specific detail from video",
+    "Topic category 8 — specific detail from video"
   ],
   "timestamps": [
-    "00:00 - Introduction",
-    "MM:SS - Topic",
-    "MM:SS - Topic",
-    "MM:SS - Topic",
+    "00:00 - Introduction and overview",
+    "MM:SS - Topic name",
+    "MM:SS - Topic name",
+    "MM:SS - Topic name",
+    "MM:SS - Topic name",
     "MM:SS - Conclusion"
   ]
 }}"""
@@ -115,15 +137,15 @@ Return this exact JSON:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gemini API error: {str(e)}")
 
-    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
-    raw = re.sub(r"\s*```\s*$", "", raw, flags=re.MULTILINE)
+    data = extract_json(raw)
 
-    try:
-        data = json.loads(raw.strip())
-    except Exception:
-        m = re.search(r'\{.*\}', raw, re.DOTALL)
-        data = json.loads(m.group()) if m else {
-            "title": f"Video {video_id}", "summary": raw, "keyPoints": [], "timestamps": []
+    if not data.get("summary"):
+        # If JSON extraction failed entirely, return raw as summary
+        data = {
+            "title": f"Video {video_id}",
+            "summary": raw,
+            "keyPoints": [],
+            "timestamps": []
         }
 
     return SummarizeResponse(
