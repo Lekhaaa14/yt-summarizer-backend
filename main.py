@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google import genai
@@ -6,6 +6,7 @@ from google.genai import types
 import os
 import re
 import json
+import httpx
 
 app = FastAPI(title="YouTube Summarizer API")
 
@@ -36,8 +37,15 @@ def get_client():
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY not configured.")
     return genai.Client(
         api_key=api_key,
-        http_options=types.HttpOptions(timeout=280000)  # 280 second timeout
+        http_options=types.HttpOptions(timeout=280000)
     )
+
+def get_supabase_headers():
+    return {
+        "apikey": os.environ.get("SUPABASE_SERVICE_KEY", ""),
+        "Authorization": f"Bearer {os.environ.get('SUPABASE_SERVICE_KEY', '')}",
+        "Content-Type": "application/json"
+    }
 
 def extract_video_id(url: str) -> str:
     match = re.search(r"(?:v=|youtu\.be/|embed/|shorts/)([a-zA-Z0-9_-]{11})", url)
@@ -63,12 +71,52 @@ def extract_json(text: str) -> dict:
             pass
     return {}
 
-JSON_SCHEMA = '''{
-  "title": "video title",
-  "summary": "5 complete paragraphs covering full video",
-  "keyPoints": ["point 1", "point 2", "point 3", "point 4", "point 5", "point 6"],
-  "timestamps": ["00:00 - Intro", "MM:SS - Topic", "MM:SS - End"]
-}'''
+def verify_token(authorization: str) -> str:
+    """Verify Supabase JWT and return user_id. Returns None if invalid/missing."""
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    token = authorization.split(" ")[1]
+    supabase_url = os.environ.get("SUPABASE_URL")
+    service_key = os.environ.get("SUPABASE_SERVICE_KEY")
+    if not supabase_url or not service_key:
+        return None
+    try:
+        response = httpx.get(
+            f"{supabase_url}/auth/v1/user",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "apikey": service_key
+            },
+            timeout=10
+        )
+        if response.status_code == 200:
+            return response.json().get("id")
+    except Exception:
+        pass
+    return None
+
+def save_summary_to_supabase(user_id: str, video_id: str, video_url: str, data: dict):
+    """Save summary to Supabase. Silently fails so it never breaks the response."""
+    supabase_url = os.environ.get("SUPABASE_URL")
+    if not supabase_url or not user_id:
+        return
+    try:
+        httpx.post(
+            f"{supabase_url}/rest/v1/summaries",
+            headers=get_supabase_headers(),
+            json={
+                "user_id": user_id,
+                "video_id": video_id,
+                "video_url": video_url,
+                "title": data.get("title", ""),
+                "summary": data.get("summary", ""),
+                "key_points": data.get("keyPoints", []),
+                "timestamps": data.get("timestamps", []),
+            },
+            timeout=10
+        )
+    except Exception:
+        pass  # Never break the main response if saving fails
 
 @app.get("/")
 def root():
@@ -80,7 +128,10 @@ def health():
 
 @app.post("/api/summarize", response_model=SummarizeResponse)
 @app.post("/summarize", response_model=SummarizeResponse)
-def summarize(req: SummarizeRequest):
+def summarize(req: SummarizeRequest, authorization: str = Header(default=None)):
+    # Verify user — optional, summary still works if not logged in
+    user_id = verify_token(authorization)
+
     client = get_client()
     try:
         video_id = extract_video_id(req.url)
@@ -93,7 +144,6 @@ def summarize(req: SummarizeRequest):
 
     try:
         if has_transcript:
-            # Transcript-based — accurate for spoken content
             trimmed = transcript[:80000]
             prompt = f"""Analyze this YouTube video transcript and return a JSON summary.
 
@@ -116,7 +166,6 @@ Return ONLY valid JSON, no markdown:
                 )
             )
         else:
-            # No transcript — watch video visually using Part.from_uri
             prompt = """Watch this entire YouTube video carefully and return a JSON summary of exactly what you see and hear.
 
 Describe real visual events, actions, scenes, people, objects, text on screen, and any audio/speech.
@@ -153,6 +202,10 @@ Return ONLY valid JSON, no markdown:
         clean = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
         clean = re.sub(r"\s*```\s*$", "", clean, flags=re.MULTILINE).strip()
         data = {"title": f"Video {video_id}", "summary": clean, "keyPoints": [], "timestamps": []}
+
+    # Save to Supabase if user is logged in
+    if user_id:
+        save_summary_to_supabase(user_id, video_id, req.url, data)
 
     return SummarizeResponse(
         title=data.get("title", f"Video {video_id}"),

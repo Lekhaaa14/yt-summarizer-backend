@@ -1,9 +1,11 @@
 services:
   - type: web
-    name: youtube-summarizer-api
+    name: yt-summarizer-backend
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --timeout-keep-alive 300
     envVars:
       - key: GEMINI_API_KEY
-        sync: false  # You'll set this manually in Render dashboard
+        sync: false
+      - key: SUPADATA_API_KEY
+        sync: false
