@@ -35,10 +35,7 @@ def get_client():
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="GEMINI_API_KEY not configured.")
-    return genai.Client(
-        api_key=api_key,
-        http_options=types.HttpOptions(timeout=280000)
-    )
+    return genai.Client(api_key=api_key)
 
 def get_supabase_headers():
     return {
@@ -72,7 +69,6 @@ def extract_json(text: str) -> dict:
     return {}
 
 def verify_token(authorization: str) -> str:
-    """Verify Supabase JWT and return user_id. Returns None if invalid/missing."""
     if not authorization or not authorization.startswith("Bearer "):
         return None
     token = authorization.split(" ")[1]
@@ -83,11 +79,8 @@ def verify_token(authorization: str) -> str:
     try:
         response = httpx.get(
             f"{supabase_url}/auth/v1/user",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "apikey": service_key
-            },
-            timeout=10
+            headers={"Authorization": f"Bearer {token}", "apikey": service_key},
+            timeout=5
         )
         if response.status_code == 200:
             return response.json().get("id")
@@ -96,7 +89,6 @@ def verify_token(authorization: str) -> str:
     return None
 
 def save_summary_to_supabase(user_id: str, video_id: str, video_url: str, data: dict):
-    """Save summary to Supabase. Silently fails so it never breaks the response."""
     supabase_url = os.environ.get("SUPABASE_URL")
     if not supabase_url or not user_id:
         return
@@ -113,10 +105,10 @@ def save_summary_to_supabase(user_id: str, video_id: str, video_url: str, data: 
                 "key_points": data.get("keyPoints", []),
                 "timestamps": data.get("timestamps", []),
             },
-            timeout=10
+            timeout=5
         )
     except Exception:
-        pass  # Never break the main response if saving fails
+        pass
 
 @app.get("/")
 def root():
@@ -129,10 +121,9 @@ def health():
 @app.post("/api/summarize", response_model=SummarizeResponse)
 @app.post("/summarize", response_model=SummarizeResponse)
 def summarize(req: SummarizeRequest, authorization: str = Header(default=None)):
-    # Verify user — optional, summary still works if not logged in
     user_id = verify_token(authorization)
-
     client = get_client()
+
     try:
         video_id = extract_video_id(req.url)
     except ValueError as e:
@@ -144,52 +135,44 @@ def summarize(req: SummarizeRequest, authorization: str = Header(default=None)):
 
     try:
         if has_transcript:
-            trimmed = transcript[:80000]
-            prompt = f"""Analyze this YouTube video transcript and return a JSON summary.
-
-TRANSCRIPT:
-{trimmed}
-
-Return ONLY valid JSON, no markdown:
+            # Transcript mode — fastest, most accurate
+            trimmed = transcript[:60000]
+            prompt = f"""Summarize this YouTube video transcript. Return ONLY valid JSON:
 {{
   "title": "infer from transcript",
-  "summary": "5 complete paragraphs covering the full video from start to finish. Never truncate.",
-  "keyPoints": ["insight 1", "insight 2", "insight 3", "insight 4", "insight 5", "insight 6", "insight 7", "insight 8"],
-  "timestamps": ["00:00 - Introduction", "MM:SS - Topic", "MM:SS - Topic", "MM:SS - Conclusion"]
-}}"""
+  "summary": "3 concise paragraphs covering the full video",
+  "keyPoints": ["point 1", "point 2", "point 3", "point 4", "point 5"],
+  "timestamps": ["00:00 - Introduction", "MM:SS - Topic", "MM:SS - Conclusion"]
+}}
+
+TRANSCRIPT:
+{trimmed}"""
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-2.0-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    temperature=0.3,
-                    max_output_tokens=4096,
+                    temperature=0.2,
+                    max_output_tokens=2048,
                 )
             )
         else:
-            prompt = """Watch this entire YouTube video carefully and return a JSON summary of exactly what you see and hear.
-
-Describe real visual events, actions, scenes, people, objects, text on screen, and any audio/speech.
-Be specific — mention actual things that happen, not generic descriptions.
-
-Return ONLY valid JSON, no markdown:
+            # Visual mode — Gemini watches the video
+            prompt = """Summarize this YouTube video. Return ONLY valid JSON:
 {
   "title": "the actual video title",
-  "summary": "3-4 paragraphs describing exactly what happens visually and audibly from start to finish. Mention specific moments, actions, and details.",
-  "keyPoints": ["specific event/detail 1", "specific event/detail 2", "specific event/detail 3", "specific event/detail 4", "specific event/detail 5"],
-  "timestamps": ["00:00 - Start", "MM:SS - Event", "MM:SS - Event", "MM:SS - End"]
+  "summary": "3 concise paragraphs describing what happens in the video",
+  "keyPoints": ["point 1", "point 2", "point 3", "point 4", "point 5"],
+  "timestamps": ["00:00 - Start", "MM:SS - Topic", "MM:SS - End"]
 }"""
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-2.0-flash",
                 contents=[
-                    types.Part.from_uri(
-                        file_uri=youtube_url,
-                        mime_type="video/mp4"
-                    ),
+                    types.Part.from_uri(file_uri=youtube_url, mime_type="video/mp4"),
                     prompt
                 ],
                 config=types.GenerateContentConfig(
-                    temperature=0.3,
-                    max_output_tokens=4096,
+                    temperature=0.2,
+                    max_output_tokens=2048,
                 )
             )
     except Exception as e:
@@ -203,7 +186,6 @@ Return ONLY valid JSON, no markdown:
         clean = re.sub(r"\s*```\s*$", "", clean, flags=re.MULTILINE).strip()
         data = {"title": f"Video {video_id}", "summary": clean, "keyPoints": [], "timestamps": []}
 
-    # Save to Supabase if user is logged in
     if user_id:
         save_summary_to_supabase(user_id, video_id, req.url, data)
 
