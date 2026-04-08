@@ -1,3 +1,5 @@
+import os
+print("DEBUG API KEY:", os.getenv("GEMINI_API_KEY"))
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -211,6 +213,3 @@ TRANSCRIPT:
         timestamps=data.get("timestamps", []),
         transcript_length=len(transcript),
     )
-
-import os
-print("API KEY:", os.getenv("GEMINI_API_KEY"))
