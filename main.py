@@ -8,6 +8,7 @@ import re
 import json
 import httpx
 #change
+
 app = FastAPI(title="YouTube Summarizer API")
 
 app.add_middleware(
@@ -210,3 +211,6 @@ TRANSCRIPT:
         timestamps=data.get("timestamps", []),
         transcript_length=len(transcript),
     )
+
+import os
+print("API KEY:", os.getenv("GEMINI_API_KEY"))
