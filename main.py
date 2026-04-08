@@ -31,6 +31,8 @@ class SummarizeResponse(BaseModel):
     timestamps: list[str]
     transcript_length: int
 
+MODELS = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"]
+
 def get_client():
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -110,6 +112,25 @@ def save_summary_to_supabase(user_id: str, video_id: str, video_url: str, data: 
     except Exception:
         pass
 
+def generate_with_fallback(client, contents, config):
+    """Try each model in order until one works."""
+    last_error = None
+    for model in MODELS:
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config
+            )
+            return response
+        except Exception as e:
+            err = str(e).lower()
+            if "quota" in err or "429" in err or "exhausted" in err or "rate" in err:
+                last_error = e
+                continue  # try next model
+            raise e  # non-quota error, raise immediately
+    raise HTTPException(status_code=429, detail="All Gemini models quota exhausted. Please try again tomorrow or add billing at console.cloud.google.com")
+
 @app.get("/")
 def root():
     return {"status": "ok", "message": "YouTube Summarizer API is running"}
@@ -133,9 +154,13 @@ def summarize(req: SummarizeRequest, authorization: str = Header(default=None)):
     transcript = (req.transcript or "").strip()
     has_transcript = len(transcript) > 50
 
+    config = types.GenerateContentConfig(
+        temperature=0.2,
+        max_output_tokens=2048,
+    )
+
     try:
         if has_transcript:
-            # Transcript mode — fastest, most accurate
             trimmed = transcript[:60000]
             prompt = f"""Summarize this YouTube video transcript. Return ONLY valid JSON:
 {{
@@ -147,16 +172,8 @@ def summarize(req: SummarizeRequest, authorization: str = Header(default=None)):
 
 TRANSCRIPT:
 {trimmed}"""
-            response = client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.2,
-                    max_output_tokens=2048,
-                )
-            )
+            response = generate_with_fallback(client, prompt, config)
         else:
-            # Visual mode — Gemini watches the video
             prompt = """Summarize this YouTube video. Return ONLY valid JSON:
 {
   "title": "the actual video title",
@@ -164,17 +181,13 @@ TRANSCRIPT:
   "keyPoints": ["point 1", "point 2", "point 3", "point 4", "point 5"],
   "timestamps": ["00:00 - Start", "MM:SS - Topic", "MM:SS - End"]
 }"""
-            response = client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=[
-                    types.Part.from_uri(file_uri=youtube_url, mime_type="video/mp4"),
-                    prompt
-                ],
-                config=types.GenerateContentConfig(
-                    temperature=0.2,
-                    max_output_tokens=2048,
-                )
+            response = generate_with_fallback(
+                client,
+                [types.Part.from_uri(file_uri=youtube_url, mime_type="video/mp4"), prompt],
+                config
             )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gemini API error: {str(e)}")
 
